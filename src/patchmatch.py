@@ -3,27 +3,16 @@ import numpy as np
 from .utils import *
 
 
-
-def cal_distance(a, b, src_pad, ref_pad, p_size):
-    patch_a = src_pad[a[0]:a[0] + p_size, a[1]:a[1] + p_size, :]
-    patch_b = ref_pad[b[0]:b[0] + p_size, b[1]:b[1] + p_size, :]
-
-    temp = patch_b - patch_a
-    num = np.sum(1 - np.int32(np.isnan(temp)))
-    dist = np.sum(np.square(np.nan_to_num(temp))) / num
-
-    return dist
-
-def initialization(src, ref, hl, lr, p_size, patch=3):
+def patchmatch(src, ref, hl, lr, iteration, padding=7, alpha=0.5):
+    # Initial
     srch, srcw, srcd = src.shape
     refh, refw, refd = ref.shape
 
-    p = p_size // 2
+    p = padding // 2
 
-    ref_padding = np.ones([refh + p * 2, refw + p * 2, 3]) * np.nan
+    ref_padding = np.zeros([refh + p * 2, refw + p * 2, 3])
     ref_padding[p: refh + p, p: refw + p, :] = ref
-
-    src_padding = np.ones([srch + p * 2, srcw + p * 2, 3]) * np.nan
+    src_padding = np.zeros([srch + p * 2, srcw + p * 2, 3])
     src_padding[p: srch + p, p: srcw + p, :] = src
 
     f = np.zeros([srch, srcw], dtype=object)
@@ -40,121 +29,101 @@ def initialization(src, ref, hl, lr, p_size, patch=3):
                 bx = np.random.randint(0, refw - 1)
 
             f[y, x] = np.array([by, bx])
-            dist[y, x] = cal_distance(a, f[y, x], src_padding, ref_padding, p_size)
+            dist[y, x] = cal_distance(a, f[y, x], src_padding, ref_padding, padding)
 
-    return f, dist, src_padding, ref_padding
+    print(f"Done initialization")
 
+    for iter in range(iteration):
 
-def propagation(a, f, dist, src_pad, ref_pad, p_size, is_odd, hl, lr):
-    srch = np.size(src_pad, 0) - p_size + 1
-    srcw = np.size(src_pad, 1) - p_size + 1
+        print(f"Start {iter}")
+        # Propagation
+        ystart = 0
+        yend = srch
+        xstart = 0
+        xend = srcw
+        change = 1
 
-    y = a[0]
-    x = a[1]
+        if iter % 2 == 0:
+            ystart = srch - 1
+            yend = -1
+            xstart = srcw - 1
+            xend = -1
+            change = -1
 
-    if is_odd:
+            # Save image
+        hist = []
 
-        d_left = dist[max(y - 1, 0), x]
-        d_up = dist[y, max(x - 1, 0)]
-        d_current = dist[y, x]
-        idx = np.argmin(np.array([d_current, d_left, d_up]))
+        aok = int((yend - ystart) / 4)
+        save_idx = [ystart, ystart + aok, ystart + 2 * aok, ystart + 3 * aok, yend - change]
 
-        if idx == 1:
-            py = f[max(y - 1, 0), x][0]
-            px = f[max(y - 1, 0), x][1]
+        for col in range(ystart, yend, change):
+            if col in save_idx:
+                hist.append(np.copy(f))
+            for row in range(xstart, xend, change):
+                best_y, best_x = f[col, row]
+                best_dist = dist[col, row]
 
-            if not inBox(py, px, hl, lr):
-                f[y, x] = f[max(y - 1, 0), x]
-                dist[y, x] = cal_distance(a, f[y, x], src_pad, ref_pad, p_size)
+                # Row propagate
+                if row - change < srcw and row - change > 0:
+                    yp = f[col, row - change][0]
+                    xp = f[col, row - change][1] + change
 
-        if idx == 2:
-            py = f[y, max(x - 1, 0)][0]
-            px = f[y, max(x - 1, 0)][1]
+                    if xp < refw and xp > 0 and not inBox(yp, xp, hl, lr):
+                        distp = cal_distance(np.array([col, row]), np.array([yp, xp]), src_padding, ref_padding,
+                                             padding)
+                        if distp < best_dist:
+                            best_y = yp
+                            best_x = xp
+                            best_dist = distp
 
-            if not inBox(py, px, hl, lr):
-                f[y, x] = f[y, max(x - 1, 0)]
-                dist[y, x] = cal_distance(a, f[y, x], src_pad, ref_pad, p_size)
+                # Col propagate
+                if col - change < srch and col - change > 0:
+                    yp = f[col - change, row][0] + change
+                    xp = f[col - change, row][1]
 
-    else:
+                    if yp < refh and yp > 0 and not inBox(yp, xp, hl, lr):
+                        distp = cal_distance(np.array([col, row]), np.array([yp, xp]), src_padding, ref_padding,
+                                             padding)
 
-        d_right = dist[min(y + 1, srch - 1), x]
-        d_down = dist[y, min(x + 1, srcw - 1)]
-        d_current = dist[y, x]
-        idx = np.argmin(np.array([d_current, d_right, d_down]))
+                        if distp < best_dist:
+                            best_y = yp
+                            best_x = xp
+                            best_dist = distp
 
-        if idx == 1:
-            py = f[min(y + 1, srch - 1), x][0]
-            px = f[min(y + 1, srch - 1), x][1]
+                # Random search
+                i = 1
+                rs_start = max(refh, refw)
+                mag = rs_start * (alpha ** i)
 
-            if not inBox(py, px, hl, lr):
-                f[y, x] = f[min(y + 1, srch - 1), x]
-                dist[y, x] = cal_distance(a, f[y, x], src_pad, ref_pad, p_size)
+                while mag > 1:
 
-        if idx == 2:
-            py = f[y, min(x + 1, srcw - 1)][0]
-            px = f[y, min(x + 1, srcw - 1)][1]
+                    ymin = max(best_y - mag, 0)
+                    ymax = min(best_y + mag + 1, refh)
 
-            if not inBox(py, px, hl, lr):
-                f[y, x] = f[y, min(x + 1, srcw - 1)]
-                dist[y, x] = cal_distance(a, f[y, x], src_pad, ref_pad, p_size)
+                    xmin = max(best_x - mag, 0)
+                    xmax = min(best_x + mag + 1, refw)
 
+                    yp = np.random.randint(ymin, ymax)
+                    xp = np.random.randint(xmin, xmax)
 
-def random_search(a, f, dist, src_pad, ref_pad, p_size, hl, lr, alpha=0.5):
-    y = a[0]
-    x = a[1]
+                    if not inBox(yp, xp, hl, lr):
 
-    refh, refw, refd = ref_pad.shape
+                        distp = cal_distance(np.array([col, row]), np.array([yp, xp]), src_padding, ref_padding,
+                                             padding)
 
-    i = 0
+                        if distp < best_dist:
+                            best_y = yp
+                            best_x = xp
+                            best_dist = distp
 
-    search_h = refh * alpha ** i
-    search_w = refw * alpha ** i
-    b_y = f[y, x][0]
-    b_x = f[y, x][1]
-    while search_h > 1 and search_w > 1:
+                    i = i + 1
+                    mag = rs_start * (alpha ** i)
 
-        search_min_r = max(b_y - search_h, 0)
-        search_max_r = min(b_y + search_h, refh - p_size)
+                f[col, row] = np.array([best_y, best_x])
+                dist[col, row] = best_dist
 
-        search_min_c = max(b_x - search_w, 0)
-        search_max_c = min(b_x + search_w, refw - p_size)
+        save_idx = []
+        hist.append(np.copy(f))
+        print(f"Done {iter}")
 
-        random_b_y = np.random.randint(search_min_r, search_max_r)
-        random_b_x = np.random.randint(search_min_c, search_max_c)
-        while inBox(random_b_y, random_b_x, hl, lr):
-            random_b_y = np.random.randint(search_min_r, search_max_r)
-            random_b_x = np.random.randint(search_min_c, search_max_c)
-
-        search_h = refh * alpha ** i
-        search_w = refw * alpha ** i
-
-        b = np.array([random_b_y, random_b_x])
-        d = cal_distance(a, b, src_pad, ref_pad, p_size)
-        if d < dist[y, x]:
-            dist[y, x] = d
-            f[y, x] = b
-
-        i += 1
-
-
-def NNS(src, ref, p_size, hl, lr, itr):
-    srch, srcw, srcd = src.shape
-
-    f, dist, src_pad, ref_pad = initialization(src, ref, hl, lr, p_size)
-
-    for itr in range(1, itr + 1):
-        if itr % 2 == 0:
-            for y in range(srch - 1, -1, -1):
-                for x in range(srcw - 1, -1, -1):
-                    a = np.array([y, x])
-                    propagation(a, f, dist, src_pad, ref_pad, p_size, False, hl, lr)
-                    random_search(a, f, dist, src_pad, ref_pad, p_size, hl, lr)
-        else:
-            for y in range(srch):
-                for x in range(srcw):
-                    a = np.array([y, x])
-                    propagation(a, f, dist, src_pad, ref_pad, p_size, True, hl, lr)
-                    random_search(a, f, dist, src_pad, ref_pad, p_size, hl, lr)
-
-        print("iteration: %d" % (itr))
-    return f
+    return f, dist, hist
